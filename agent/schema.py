@@ -19,8 +19,10 @@ def db_path(db_id: str) -> Path:
     return DB_DIR / f"{db_id}.sqlite"
 
 
-def _q(ident: str) -> str:
+def _q(ident: str | None) -> str:
     """Double-quote a SQL identifier, escaping any embedded quotes."""
+    if ident is None:
+        raise ValueError("SQL identifier is None")
     return '"' + ident.replace('"', '""') + '"'
 
 
@@ -52,9 +54,10 @@ def render_schema(db_id: str) -> str:
                 col_lines.append(line)
             for fk in conn.execute(f"PRAGMA foreign_key_list({_q(t)})"):
                 # (id, seq, ref_table, from, to, on_update, on_delete, match)
-                col_lines.append(
-                    f"  FOREIGN KEY ({_q(fk[3])}) REFERENCES {_q(fk[2])}({_q(fk[4])})"
-                )
+                ref = f"REFERENCES {_q(fk[2])}"
+                if fk[4] is not None:
+                    ref += f"({_q(fk[4])})"
+                col_lines.append(f"  FOREIGN KEY ({_q(fk[3])}) {ref}")
             parts.append(",\n".join(col_lines))
             parts.append(");")
     return "\n".join(parts)
