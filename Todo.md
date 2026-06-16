@@ -1,5 +1,19 @@
 # Home Assignment: Code Changes Summary
 
+
+REPORT.md - Your writeup (≤ 3 pages)
+infra/grafana/provisioning/dashboards/serving.json - Your Grafana dashboard with all required panels
+agent/graph.py, agent/prompts.py - Your implemented agent
+evals/run_eval.py - Your eval runner |
+results/eval_baseline.json - Baseline eval results
+results/eval_after_tuning.json - Post-tuning eval results
+screenshots/vllm_manual_query.png - vLLM serving + a manual query returning SQL (Phase 1)
+screenshots/grafana_serving.png - The full Grafana dashboard with panels reacting to load (Phase 2)
+screenshots/langfuse_trace.png - A Langfuse trace showing a verify→revise loop (Phase 4)
+screenshots/langfuse_tags.png - The Langfuse trace list with your metadata tags visible (Phase 4)
+screenshots/grafana_eval_run.png - The Grafana dashboard while the baseline eval runs (Phase 5)
+screenshots/grafana_before.png, screenshots/grafana_after.png - Before/after the tuning change that moved the needle (Phase 6)
+
 ## Files to modify
 
 | File | What to do | Phase |
