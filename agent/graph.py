@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -78,7 +79,20 @@ def _extract_sql(text: str) -> str:
     otherwise the whole reply. You may need to harden this for your prompts.
     """
     fenced = re.search(r"```(?:sql)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    return (fenced.group(1) if fenced else text).strip()
+    candidate = (fenced.group(1) if fenced else text).strip()
+    match = re.search(r"\b(WITH|SELECT)\b.*", candidate, re.DOTALL | re.IGNORECASE)
+    return (match.group(0) if match else candidate).strip()
+
+
+def _extract_json_object(text: str) -> dict[str, Any]:
+    """Parse the first JSON object in a model reply."""
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    candidate = (fenced.group(1) if fenced else text).strip()
+    start = candidate.find("{")
+    end = candidate.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        raise ValueError("no JSON object found")
+    return json.loads(candidate[start : end + 1])
 
 
 def generate_sql_node(state: AgentState) -> dict:
@@ -124,7 +138,41 @@ def verify_node(state: AgentState) -> dict:
     What counts as "not plausible" is yours to define - see the Phase 3 targets
     in the README.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution_render = state.execution.render() if state.execution else "ERROR: SQL was not executed."
+    response = llm().invoke([
+        ("system", prompts.VERIFY_SYSTEM),
+        ("user", prompts.VERIFY_USER.format(
+            schema=state.schema,
+            question=state.question,
+            sql=state.sql,
+            execution=execution_render,
+        )),
+    ])
+
+    try:
+        parsed = _extract_json_object(response.content)
+        ok = bool(parsed.get("ok", False))
+        issue = str(parsed.get("issue", "")).strip()
+    except Exception as e:  # noqa: BLE001
+        ok = bool(state.execution and state.execution.ok and state.execution.row_count > 0)
+        issue = (
+            f"Verifier returned invalid JSON ({type(e).__name__}: {e}). "
+            "Revise if the SQL errored or returned no rows."
+        )
+
+    if not ok and not issue:
+        issue = "The SQL result does not plausibly answer the question."
+
+    return {
+        "verify_ok": ok,
+        "verify_issue": issue,
+        "history": state.history + [{
+            "node": "verify",
+            "ok": ok,
+            "issue": issue,
+            "execution": execution_render,
+        }],
+    }
 
 
 def revise_node(state: AgentState) -> dict:
@@ -137,7 +185,29 @@ def revise_node(state: AgentState) -> dict:
 
     Return: {"sql": <str>, "iteration": state.iteration + 1, ...}.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    execution_render = state.execution.render() if state.execution else "ERROR: SQL was not executed."
+    response = llm().invoke([
+        ("system", prompts.REVISE_SYSTEM),
+        ("user", prompts.REVISE_USER.format(
+            schema=state.schema,
+            question=state.question,
+            prior_sql=state.sql,
+            execution=execution_render,
+            issue=state.verify_issue,
+            iteration=state.iteration,
+            max_iterations=MAX_ITERATIONS,
+        )),
+    ])
+    sql = _extract_sql(response.content)
+    return {
+        "sql": sql,
+        "iteration": state.iteration + 1,
+        "history": state.history + [{
+            "node": "revise",
+            "sql": sql,
+            "issue": state.verify_issue,
+        }],
+    }
 
 
 def route_after_verify(state: AgentState) -> str:
@@ -146,7 +216,9 @@ def route_after_verify(state: AgentState) -> str:
     Two reasons to end: the verifier was happy (state.verify_ok), or you've hit
     the iteration cap (state.iteration >= MAX_ITERATIONS). Otherwise, revise.
     """
-    raise NotImplementedError("Implement in Phase 3")
+    if state.verify_ok or state.iteration >= MAX_ITERATIONS:
+        return "end"
+    return "revise"
 
 
 # ---- Graph wiring -----------------------------------------------------
