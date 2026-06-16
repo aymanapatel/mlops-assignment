@@ -17,8 +17,11 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from typing import Any
 
 import httpx
+
+from agent.graph import MAX_ITERATIONS
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_EVAL_FILE = ROOT / "evals" / "eval_set.jsonl"
@@ -58,7 +61,85 @@ def matches(gold_rows: list[tuple] | None, pred_rows: list[tuple] | None) -> boo
 
 def eval_one(question: dict, agent_url: str) -> dict:
     """Score one question. Return a dict capturing per-iteration correctness."""
-    raise NotImplementedError("Phase 5")
+    db_id = question["db_id"]
+    question_text = question["question"]
+    gold_sql = question["gold_sql"]
+
+    gold_ok, gold_rows, gold_error = run_sql(db_id, gold_sql)
+    started = time.monotonic()
+
+    result: dict[str, Any] = {
+        "question": question_text,
+        "db_id": db_id,
+        "gold_sql": gold_sql,
+        "gold_ok": gold_ok,
+        "gold_error": gold_error,
+        "agent_ok": False,
+        "agent_error": None,
+        "agent_sql": "",
+        "iterations": 0,
+        "latency_seconds": None,
+        "history": [],
+        "attempts": [],
+        "final_correct": False,
+    }
+
+    if not gold_ok:
+        result["agent_error"] = f"gold SQL failed: {gold_error}"
+        result["latency_seconds"] = time.monotonic() - started
+        return result
+
+    try:
+        with httpx.Client(timeout=120.0) as client:
+            response = client.post(
+                agent_url,
+                json={
+                    "question": question_text,
+                    "db": db_id,
+                    "tags": {
+                        "phase": "phase5",
+                        "run": "eval_baseline",
+                        "db": db_id,
+                    },
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except Exception as e:  # noqa: BLE001
+        result["agent_error"] = f"{type(e).__name__}: {e}"
+        result["latency_seconds"] = time.monotonic() - started
+        return result
+
+    result["latency_seconds"] = time.monotonic() - started
+    result["agent_ok"] = bool(payload.get("ok", False))
+    result["agent_error"] = payload.get("error")
+    result["agent_sql"] = payload.get("sql", "")
+    result["iterations"] = int(payload.get("iterations", 0) or 0)
+    result["history"] = payload.get("history", [])
+
+    sql_attempts = [
+        h["sql"]
+        for h in result["history"]
+        if h.get("node") in {"generate_sql", "revise"} and h.get("sql")
+    ]
+    if not sql_attempts and result["agent_sql"]:
+        sql_attempts = [result["agent_sql"]]
+
+    for idx, sql in enumerate(sql_attempts, 1):
+        pred_ok, pred_rows, pred_error = run_sql(db_id, sql)
+        correct = pred_ok and matches(gold_rows, pred_rows)
+        result["attempts"].append({
+            "iteration": idx,
+            "sql": sql,
+            "ok": pred_ok,
+            "error": pred_error,
+            "correct": correct,
+        })
+
+    if result["attempts"]:
+        result["final_correct"] = bool(result["attempts"][-1]["correct"])
+
+    return result
 
 
 def summarize(results: list[dict]) -> dict:
@@ -70,7 +151,61 @@ def summarize(results: list[dict]) -> dict:
     The agent stopped emitting; whatever it had at termination is what
     would have been served had we polled at iteration k.
     """
-    raise NotImplementedError("Phase 5")
+    total = len(results)
+    if total == 0:
+        return {
+            "total": 0,
+            "final_correct": 0,
+            "final_accuracy": 0.0,
+            "per_iteration": {},
+        }
+
+    final_correct = sum(1 for r in results if r.get("final_correct"))
+    agent_success = sum(1 for r in results if r.get("agent_ok"))
+    revised = sum(
+        1
+        for r in results
+        if any(h.get("node") == "revise" for h in r.get("history", []))
+    )
+    latencies = [
+        float(r["latency_seconds"])
+        for r in results
+        if r.get("latency_seconds") is not None
+    ]
+    iterations = [int(r.get("iterations", 0) or 0) for r in results]
+
+    per_iteration: dict[str, dict[str, float | int]] = {}
+    for k in range(1, MAX_ITERATIONS + 1):
+        correct = 0
+        attempted = 0
+        for r in results:
+            attempts = r.get("attempts", [])
+            if not attempts:
+                continue
+            attempted += 1
+            carried_attempt = attempts[min(k, len(attempts)) - 1]
+            if carried_attempt.get("correct"):
+                correct += 1
+        per_iteration[str(k)] = {
+            "correct": correct,
+            "attempted": attempted,
+            "total": total,
+            "accuracy": correct / total,
+        }
+
+    return {
+        "total": total,
+        "agent_success": agent_success,
+        "agent_success_rate": agent_success / total,
+        "final_correct": final_correct,
+        "final_accuracy": final_correct / total,
+        "revised": revised,
+        "revise_rate": revised / total,
+        "avg_iterations": sum(iterations) / total,
+        "max_iterations": max(iterations) if iterations else 0,
+        "avg_latency_seconds": sum(latencies) / len(latencies) if latencies else None,
+        "per_iteration": per_iteration,
+    }
 
 
 # ---------- Main (provided) --------------------------------------------
