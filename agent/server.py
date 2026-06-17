@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -17,7 +18,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 load_dotenv()
@@ -64,6 +65,122 @@ else:
 
 app = FastAPI()
 
+_METRIC_BUCKETS = (
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1.0,
+    1.5,
+    2.0,
+    2.5,
+    3.0,
+    4.0,
+    5.0,
+    7.5,
+    10.0,
+    15.0,
+    30.0,
+    60.0,
+    120.0,
+)
+_metrics_lock = threading.Lock()
+_request_counts: dict[tuple[str, str, str, str], int] = {}
+_latency_bucket_counts: dict[tuple[str, str, str, str], dict[float, int]] = {}
+_latency_counts: dict[tuple[str, str, str, str], int] = {}
+_latency_sums: dict[tuple[str, str, str, str], float] = {}
+
+
+def _metric_label(value: str | None) -> str:
+    return (value or "none").replace("\\", "\\\\").replace('"', '\\"').replace("\n", "_")
+
+
+def _normalize_tags(tags: dict[str, str]) -> dict[str, str]:
+    normalized = dict(tags)
+    if normalized.get("variant") == "unoptimized":
+        normalized["variant"] = "baseline"
+    if "run" in normalized:
+        normalized["run"] = normalized["run"].replace("unoptimized", "baseline")
+    return normalized
+
+
+def _trace_tags(tags: dict[str, str]) -> list[str]:
+    variant = tags.get("variant")
+    if variant in {"baseline", "optimized"}:
+        return [variant]
+    return []
+
+
+def _metric_key(status: str, tags: dict[str, str]) -> tuple[str, str, str, str]:
+    return (
+        status,
+        _metric_label(tags.get("variant")),
+        _metric_label(tags.get("phase")),
+        _metric_label(tags.get("run")),
+    )
+
+
+def _label_string(key: tuple[str, str, str, str]) -> str:
+    status, variant, phase, run = key
+    return f'status="{status}",variant="{variant}",phase="{phase}",run="{run}"'
+
+
+def _record_agent_request(status: str, latency_seconds: float, tags: dict[str, str]) -> None:
+    key = _metric_key(status, tags)
+    with _metrics_lock:
+        _request_counts[key] = _request_counts.get(key, 0) + 1
+        _latency_counts[key] = _latency_counts.get(key, 0) + 1
+        _latency_sums[key] = _latency_sums.get(key, 0.0) + latency_seconds
+        bucket_counts = _latency_bucket_counts.setdefault(
+            key,
+            {bucket: 0 for bucket in _METRIC_BUCKETS},
+        )
+        for bucket in _METRIC_BUCKETS:
+            if latency_seconds <= bucket:
+                bucket_counts[bucket] += 1
+
+
+def _render_agent_metrics() -> str:
+    with _metrics_lock:
+        counts = dict(_request_counts)
+        buckets = {key: dict(value) for key, value in _latency_bucket_counts.items()}
+        latency_counts = dict(_latency_counts)
+        latency_sums = dict(_latency_sums)
+
+    lines = [
+        "# HELP agent_requests_total Full end-to-end agent /answer requests.",
+        "# TYPE agent_requests_total counter",
+    ]
+    if not counts:
+        empty_key = ("ok", "none", "none", "none")
+        lines.append(f"agent_requests_total{{{_label_string(empty_key)}}} 0")
+    for key, count in sorted(counts.items()):
+        lines.append(f"agent_requests_total{{{_label_string(key)}}} {count}")
+
+    lines.extend([
+        "# HELP agent_request_latency_seconds Full end-to-end agent /answer latency in seconds.",
+        "# TYPE agent_request_latency_seconds histogram",
+    ])
+    metric_keys = sorted(set(buckets) | set(latency_counts))
+    if not metric_keys:
+        metric_keys = [("ok", "none", "none", "none")]
+        buckets[metric_keys[0]] = {bucket: 0 for bucket in _METRIC_BUCKETS}
+        latency_counts[metric_keys[0]] = 0
+        latency_sums[metric_keys[0]] = 0.0
+    for key in metric_keys:
+        label_string = _label_string(key)
+        bucket_counts = buckets.get(key, {bucket: 0 for bucket in _METRIC_BUCKETS})
+        count = latency_counts.get(key, 0)
+        for bucket in _METRIC_BUCKETS:
+            lines.append(
+                f'agent_request_latency_seconds_bucket{{{label_string},le="{bucket}"}} '
+                f"{bucket_counts.get(bucket, 0)}"
+            )
+        lines.append(f'agent_request_latency_seconds_bucket{{{label_string},le="+Inf"}} {count}')
+        lines.append(f"agent_request_latency_seconds_count{{{label_string}}} {count}")
+        lines.append(f"agent_request_latency_seconds_sum{{{label_string}}} {latency_sums.get(key, 0.0)}")
+    return "\n".join(lines) + "\n"
+
 
 class AnswerRequest(BaseModel):
     question: str
@@ -85,6 +202,11 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics")
+def metrics() -> Response:
+    return Response(_render_agent_metrics(), media_type="text/plain; version=0.0.4")
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     logger.exception(
@@ -103,26 +225,27 @@ async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONR
 def answer(req: AnswerRequest) -> AnswerResponse:
     started = time.perf_counter()
     state = AgentState(question=req.question, db_id=req.db)
-    trace_tags = [f"{key}:{value}" for key, value in req.tags.items()]
+    tags = _normalize_tags(req.tags)
     config: dict[str, Any] = {
         "callbacks": [_lf_handler] if _lf_handler is not None else [],
-        "metadata": req.tags,
-        "tags": trace_tags,
+        "metadata": tags,
+        "tags": _trace_tags(tags),
     }
     logger.info(
         "answer.start db=%s tags=%s question=%r",
         req.db,
-        req.tags,
+        tags,
         req.question[:300],
     )
     try:
         final = graph.invoke(state, config=config)
     except Exception as e:  # noqa: BLE001
         elapsed = time.perf_counter() - started
+        _record_agent_request("error", elapsed, tags)
         logger.exception(
             "answer.graph_failed db=%s tags=%s elapsed=%.3fs question=%r",
             req.db,
-            req.tags,
+            tags,
             elapsed,
             req.question[:300],
         )
@@ -135,10 +258,11 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     elapsed = time.perf_counter() - started
 
     if execution is None:
+        _record_agent_request("error", elapsed, tags)
         logger.error(
             "answer.no_execution db=%s tags=%s iterations=%s elapsed=%.3fs sql=%r history=%s",
             req.db,
-            req.tags,
+            tags,
             iteration,
             elapsed,
             sql[:500],
@@ -153,10 +277,11 @@ def answer(req: AnswerRequest) -> AnswerResponse:
             history=history,
         )
     if not execution.ok:
+        _record_agent_request("error", elapsed, tags)
         logger.warning(
             "answer.execution_failed db=%s tags=%s iterations=%s elapsed=%.3fs error=%r sql=%r",
             req.db,
-            req.tags,
+            tags,
             iteration,
             elapsed,
             execution.error,
@@ -174,12 +299,13 @@ def answer(req: AnswerRequest) -> AnswerResponse:
     logger.info(
         "answer.ok db=%s tags=%s iterations=%s rows=%s elapsed=%.3fs sql=%r",
         req.db,
-        req.tags,
+        tags,
         iteration,
         len(execution.rows or []),
         elapsed,
         sql[:500],
     )
+    _record_agent_request("ok", elapsed, tags)
     return AnswerResponse(
         sql=sql,
         rows=[list(r) for r in (execution.rows or [])],
