@@ -17,6 +17,7 @@ import asyncio
 import json
 import random
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import aiohttp
@@ -31,9 +32,10 @@ async def fire_one(
     session: aiohttp.ClientSession,
     url: str,
     question: dict,
+    tags: dict[str, str],
     results: list[dict],
 ) -> None:
-    payload = {"question": question["question"], "db": question["db_id"]}
+    payload = {"question": question["question"], "db": question["db_id"], "tags": tags}
     t0 = time.monotonic()
     status = "ok"
     err: str | None = None
@@ -68,13 +70,15 @@ async def drive(args: argparse.Namespace) -> None:
 
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
+        started_at = datetime.now(timezone.utc)
         start = time.monotonic()
         deadline = start + args.duration
+        scheduled_until_at = started_at.timestamp() + args.duration
         tasks: list[asyncio.Task] = []
         next_fire = start
         while time.monotonic() < deadline:
             q = rnd.choice(questions)
-            tasks.append(asyncio.create_task(fire_one(session, args.agent_url, q, results)))
+            tasks.append(asyncio.create_task(fire_one(session, args.agent_url, q, args.tags, results)))
             next_fire += interval
             sleep_for = next_fire - time.monotonic()
             if sleep_for > 0:
@@ -83,6 +87,7 @@ async def drive(args: argparse.Namespace) -> None:
         if tasks:
             await asyncio.wait(tasks, timeout=60.0)
         wall = time.monotonic() - start
+        finished_at = datetime.now(timezone.utc)
 
     latencies = sorted(r["latency_seconds"] for r in results if r["status"] == "ok")
 
@@ -95,6 +100,10 @@ async def drive(args: argparse.Namespace) -> None:
     summary = {
         "requested_rps": args.rps,
         "duration_seconds": args.duration,
+        "started_at_utc": started_at.isoformat(),
+        "scheduled_until_utc": datetime.fromtimestamp(scheduled_until_at, timezone.utc).isoformat(),
+        "finished_at_utc": finished_at.isoformat(),
+        "tags": args.tags,
         "wall_clock_seconds": wall,
         "total_requests": len(results),
         "achieved_rps": (len(results) / wall) if wall > 0 else 0.0,
@@ -120,7 +129,20 @@ def main() -> None:
     p.add_argument("--duration", type=int, default=300, help="seconds to drive load")
     p.add_argument("--agent-url", default=AGENT_URL_DEFAULT)
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    p.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="metadata tag to send to the agent; repeatable",
+    )
     args = p.parse_args()
+    args.tags = {}
+    for item in args.tag:
+        if "=" not in item:
+            raise SystemExit(f"--tag must be KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        args.tags[key] = value
     asyncio.run(drive(args))
 
 
